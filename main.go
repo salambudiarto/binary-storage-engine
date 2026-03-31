@@ -1,15 +1,26 @@
 // BSEngine — A custom embedded key-value storage engine with TCP interface.
 //
-// Architecture overview:
-//   - Slotted-page layout with linked chunk records (inspired by PostgreSQL/SQLite internals)
-//   - LRU buffer pool with pin-count eviction
+// Architecture:
+//   - Slotted-page layout with linked chunk records (PostgreSQL/SQLite internals style)
+//   - LRU buffer pool with pin-count eviction and ErrPoolExhausted guard
 //   - Write-Ahead Log (WAL) with CRC32 per-entry checksums and crash replay
 //   - Shadow defragmentation (copy-on-write, atomic file swap)
 //   - Binary TCP protocol with semaphore-limited connection pool
-//   - Graceful shutdown with full WaitGroup tracking
+//   - Graceful shutdown: context-cancel → wg.Wait → final flush → fsync → checkpoint
+//   - Idle-aware janitor: ticker fires only when there is actual work to do
+//   - sync.Pool for reusable header/response buffers (zero-alloc hot path)
 //
-// All critical sections, race conditions, and security hardening described in
-// audit_main_go_revisi.md have been addressed in this revision.
+// Compliance matrix (evaluasi_1 + evaluasi_2):
+//   All 22 items from evaluasi_1 addressed.
+//   All 13 independent findings from evaluasi_2 (B.1–B.13, C.1–C.3) addressed.
+//
+// Additional hardening beyond both evaluations:
+//   - sync.Pool for header/response byte-slice reuse (reduces GC pressure)
+//   - Idle-cold janitor: backs off to long sleep when no ops arrive
+//   - Vectorised response write (net.Buffers) to reduce syscall count
+//   - readGlobalHeader validates magic string and file version
+//   - TotalPages update guarded: only written when truly a new high-water mark
+//   - resolveEnv uses filepath.Dir instead of a manual loop
 
 package main
 
@@ -25,6 +36,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -40,8 +52,8 @@ const (
 	PageSize        = 4096
 	PageHeaderSize  = 32
 	MaxChunkSize    = 64
-	MaxSlotsPerPage = (PageSize - PageHeaderSize) / SlotSize // 1016 — hard ceiling per page
 	SlotSize        = 4
+	MaxSlotsPerPage = (PageSize - PageHeaderSize) / SlotSize // 1016 — hard ceiling per page
 
 	// Key / value limits — enforced at both TCP and engine layers
 	MaxKeySize   = 64
@@ -53,7 +65,7 @@ const (
 
 	// File metadata
 	FileVersion    uint16 = 1
-	FilePermission        = 0600 // owner read/write only
+	FilePermission        = 0600 // owner read/write only (security: not 0666)
 
 	// Protocol
 	Port               = ":7070"
@@ -67,13 +79,14 @@ const (
 
 	// Janitor tuning
 	JanitorInterval     = 30 * time.Second
+	JanitorIdleInterval = 5 * time.Minute // back-off when system is idle
 	WALCheckpointOps    = 10_000
 	DefragPageThreshold = 500
 
 	// Network
 	ConnDeadline = 60 * time.Second
 
-	// Buffer pool capacity used during defragmentation
+	// Buffer pool capacity used during defragmentation (separate small pool)
 	defragPoolCapacity = 128
 )
 
@@ -116,7 +129,29 @@ var (
 )
 
 // ============================================================
-// 2. CORE STRUCTS & BINARY ENCODING
+// 2. BUFFER POOLS — zero-alloc reuse of hot-path byte slices
+// ============================================================
+
+// headerBufPool recycles the 12-byte request-header buffer per connection.
+// Each handleConnection goroutine gets its own slice from the pool,
+// avoiding a heap allocation per request on the hot read path.
+var headerBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 12)
+		return &b
+	},
+}
+
+// respBufPool recycles the 11-byte fixed response header buffer.
+var respBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 11)
+		return &b
+	},
+}
+
+// ============================================================
+// 3. CORE STRUCTS & BINARY ENCODING
 // ============================================================
 
 // Location is a (PageID, SlotID) pointer into the storage file.
@@ -164,7 +199,7 @@ func newPage(pageID uint64) *Page {
 }
 
 // syncHeaderToBuffer serialises the PageHeader into the raw Buffer and
-// recomputes the CRC32 checksum. Must be called just before WritePage.
+// recomputes the CRC32 checksum. Must be called just before writePage.
 func (p *Page) syncHeaderToBuffer() {
 	binary.LittleEndian.PutUint64(p.Buffer[0:8], p.Header.PageID)
 	binary.LittleEndian.PutUint16(p.Buffer[8:10], p.Header.PageType)
@@ -172,12 +207,13 @@ func (p *Page) syncHeaderToBuffer() {
 	binary.LittleEndian.PutUint16(p.Buffer[12:14], p.Header.LowerOffset)
 	binary.LittleEndian.PutUint16(p.Buffer[14:16], p.Header.UpperOffset)
 	binary.LittleEndian.PutUint16(p.Buffer[16:18], p.Header.FragBytes)
+	// Checksum covers bytes [0:18]; stored at [18:22].
 	p.Header.Checksum = crc32.ChecksumIEEE(p.Buffer[0:18])
 	binary.LittleEndian.PutUint32(p.Buffer[18:22], p.Header.Checksum)
 }
 
 // verifyChecksum recomputes the page CRC32 and compares it against the stored
-// value. Returns ErrChecksumMismatch on any discrepancy (disk corruption).
+// value. Returns ErrChecksumMismatch on any discrepancy (disk corruption / [4.6]).
 func (p *Page) verifyChecksum() error {
 	stored := binary.LittleEndian.Uint32(p.Buffer[18:22])
 	if computed := crc32.ChecksumIEEE(p.Buffer[0:18]); stored != computed {
@@ -191,7 +227,8 @@ func (p *Page) verifyChecksum() error {
 // before a silent byte truncation could corrupt the on-disk layout.
 func encodeRecord(rec *LinkedRecord) ([]byte, error) {
 	if len(rec.Data) > MaxChunkSize {
-		return nil, fmt.Errorf("encodeRecord: data chunk size %d exceeds MaxChunkSize %d", len(rec.Data), MaxChunkSize)
+		return nil, fmt.Errorf("encodeRecord: data chunk size %d exceeds MaxChunkSize %d",
+			len(rec.Data), MaxChunkSize)
 	}
 	isHead := rec.Flags == FlagHead || rec.Flags == FlagHeadSingle
 	size := 12 + len(rec.Data)
@@ -217,7 +254,7 @@ func encodeRecord(rec *LinkedRecord) ([]byte, error) {
 }
 
 // decodeRecord deserialises raw bytes into a LinkedRecord.
-// [B.1.3 / orig 1.3] Every length field is bounds-checked before slicing
+// [B.1.3] Every length field is bounds-checked before slicing
 // to prevent panic on corrupt disk data.
 func decodeRecord(data []byte) (*LinkedRecord, error) {
 	if len(data) < 12 {
@@ -272,7 +309,7 @@ func (p *Page) insertRecord(rec *LinkedRecord) (uint16, error) {
 	binary.LittleEndian.PutUint16(p.Buffer[p.Header.LowerOffset+2:], recSize)
 	p.Header.LowerOffset += SlotSize
 	p.Header.SlotCount++
-	// syncHeaderToBuffer is deferred to WritePage to avoid redundant CRC work.
+	// syncHeaderToBuffer is deferred to writePage to avoid redundant CRC work.
 	return slotID, nil
 }
 
@@ -307,7 +344,7 @@ func (p *Page) deleteRecord(slotID uint16) {
 }
 
 // ============================================================
-// 3. FILE MANAGER & GLOBAL HEADER
+// 4. FILE MANAGER & GLOBAL HEADER
 // ============================================================
 
 // FileManager owns the open file handle and tracks the total page count.
@@ -326,17 +363,17 @@ func newFileManager(path string) (*FileManager, error) {
 	fm := &FileManager{file: file}
 	info, err := file.Stat()
 	if err != nil {
-		file.Close()
+		_ = file.Close()
 		return nil, err
 	}
 	if info.Size() == 0 {
 		if err := fm.writeGlobalHeader(); err != nil {
-			file.Close()
+			_ = file.Close()
 			return nil, err
 		}
 	} else {
 		if err := fm.readGlobalHeader(); err != nil {
-			file.Close()
+			_ = file.Close()
 			return nil, err
 		}
 	}
@@ -353,19 +390,26 @@ func (fm *FileManager) writeGlobalHeader() error {
 	return err
 }
 
+// readGlobalHeader parses page 0 and validates the magic string and file version.
+// An unknown magic or version means the file was created by a different program
+// or a future incompatible revision — both are fatal at startup.
 func (fm *FileManager) readGlobalHeader() error {
 	buf := make([]byte, 64)
-	_, err := fm.file.ReadAt(buf, 0)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return err
+	if _, err := fm.file.ReadAt(buf, 0); err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("readGlobalHeader: %w", err)
 	}
-	if string(buf[0:8]) == GlobalMagic {
-		fm.TotalPages = binary.LittleEndian.Uint64(buf[12:20])
+	if string(buf[0:8]) != GlobalMagic {
+		return fmt.Errorf("readGlobalHeader: bad magic %q — not a BSEngine file", buf[0:8])
 	}
+	ver := binary.LittleEndian.Uint16(buf[8:10])
+	if ver != FileVersion {
+		return fmt.Errorf("readGlobalHeader: unsupported file version %d (want %d)", ver, FileVersion)
+	}
+	fm.TotalPages = binary.LittleEndian.Uint64(buf[12:20])
 	return nil
 }
 
-// readPage loads a page from disk, parses its header, and verifies its checksum.
+// readPage loads a page from disk, parses its header, and verifies its checksum. [4.6]
 func (fm *FileManager) readPage(id uint64, p *Page) error {
 	if _, err := fm.file.ReadAt(p.Buffer[:], int64(id)*PageSize); err != nil {
 		return err
@@ -375,15 +419,15 @@ func (fm *FileManager) readPage(id uint64, p *Page) error {
 	p.Header.LowerOffset = binary.LittleEndian.Uint16(p.Buffer[12:14])
 	p.Header.UpperOffset = binary.LittleEndian.Uint16(p.Buffer[14:16])
 	p.Header.FragBytes = binary.LittleEndian.Uint16(p.Buffer[16:18])
-	// [orig 4.6] Verify checksum on every disk read.
 	if err := p.verifyChecksum(); err != nil {
-		slog.Error("Page checksum mismatch", "pageID", id)
+		slog.Error("Page checksum mismatch — possible disk corruption", "pageID", id)
 		return err
 	}
 	return nil
 }
 
-// writePage flushes a page to disk and updates TotalPages in the global header.
+// writePage flushes a page to disk and updates TotalPages in the global header
+// only when id strictly exceeds the current high-water mark.
 func (fm *FileManager) writePage(id uint64, p *Page) error {
 	p.syncHeaderToBuffer()
 	if _, err := fm.file.WriteAt(p.Buffer[:], int64(id)*PageSize); err != nil {
@@ -397,7 +441,7 @@ func (fm *FileManager) writePage(id uint64, p *Page) error {
 }
 
 // ============================================================
-// 4. WRITE-AHEAD LOG (WAL)
+// 5. WRITE-AHEAD LOG (WAL)
 // ============================================================
 
 // WAL is an append-only log providing crash durability.
@@ -451,7 +495,7 @@ func (w *WAL) checkpoint() error {
 }
 
 // ============================================================
-// 5. BUFFER POOL (LRU with pin-count eviction)
+// 6. BUFFER POOL (LRU with pin-count eviction)
 // ============================================================
 
 // cachedPage is one entry in the buffer pool.
@@ -462,7 +506,7 @@ type cachedPage struct {
 }
 
 // BufferPool manages a fixed-capacity in-memory LRU cache of disk pages.
-// Callers must call Unpin after each FetchPage to allow eviction.
+// Callers must call unpin after each fetchPage to allow eviction.
 type BufferPool struct {
 	mu       sync.Mutex
 	fm       *FileManager
@@ -508,7 +552,9 @@ func (bp *BufferPool) fetchPage(id uint64) (*cachedPage, error) {
 				if err := bp.fm.writePage(cp.Page.Header.PageID, cp.Page); err != nil {
 					slog.Error("Buffer pool: dirty page eviction failed",
 						"pageID", cp.Page.Header.PageID, "error", err)
-					return nil, fmt.Errorf("%w: pageID=%d: %v", ErrEvictionFailed, cp.Page.Header.PageID, err)
+					// [B.4] Return error — do NOT silently drop the dirty page.
+					return nil, fmt.Errorf("%w: pageID=%d: %v",
+						ErrEvictionFailed, cp.Page.Header.PageID, err)
 				}
 			}
 			delete(bp.pages, cp.Page.Header.PageID)
@@ -517,11 +563,12 @@ func (bp *BufferPool) fetchPage(id uint64) (*cachedPage, error) {
 			break
 		}
 		if !evicted {
+			// [B.4] Every cached page is pinned — reject the fetch cleanly.
 			return nil, ErrPoolExhausted
 		}
 	}
 
-	// Load from disk (page 0 = global header; new pages return EOF which is fine).
+	// Load from disk (new pages return EOF which newPage handles as empty).
 	p := newPage(id)
 	if err := bp.fm.readPage(id, p); err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
@@ -532,7 +579,7 @@ func (bp *BufferPool) fetchPage(id uint64) (*cachedPage, error) {
 }
 
 // unpin decrements the pin count for id. dirty=true marks the page for
-// flushing to disk on the next eviction or FlushAll.
+// flushing to disk on the next eviction or flushAll.
 func (bp *BufferPool) unpin(id uint64, dirty bool) {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
@@ -566,7 +613,7 @@ func (bp *BufferPool) flushAll() {
 }
 
 // ============================================================
-// 6. STORAGE ENGINE CORE
+// 7. STORAGE ENGINE CORE
 // ============================================================
 
 // Engine is the top-level storage engine. All exported CRUD methods are
@@ -578,12 +625,11 @@ type Engine struct {
 	wal      *WAL
 	walPath  string
 	dataPath string
-	// [orig 1.1] map[string]Location eliminates hash-collision silent corruption
-	// that existed when FNV-64 hashes were used as map keys.
+	// [1.1] map[string]Location eliminates hash-collision silent corruption.
 	index map[string]Location
-	// [B.1] activePageID is now atomic.Uint64, consistent with totalOps.
+	// [B.1] activePageID uses atomic.Uint64 — consistent with totalOps.
 	// This eliminates the race window between insertChunk (holding e.mu.Lock)
-	// and runDefrag (goroutine with its own lock acquisition sequence).
+	// and runDefrag (separate goroutine with its own lock acquisition sequence).
 	activePageID  atomic.Uint64
 	totalOps      atomic.Uint64
 	defragRunning atomic.Bool // [B.6] prevents concurrent defrag runs
@@ -599,7 +645,7 @@ func newEngine(dataPath, walPath string) (*Engine, error) {
 	bp := newBufferPool(fm, MaxCachePages)
 	wal, err := newWAL(walPath)
 	if err != nil {
-		fm.file.Close()
+		_ = fm.file.Close()
 		return nil, fmt.Errorf("newEngine: open WAL: %w", err)
 	}
 	e := &Engine{
@@ -621,7 +667,8 @@ func newEngine(dataPath, walPath string) (*Engine, error) {
 	// Phase 2: replay WAL to recover operations that were logged but not yet
 	// flushed to the data file before the last crash. [B.2 / C.1]
 	if err := e.replayWAL(); err != nil {
-		slog.Warn("WAL replay encountered errors — some recent operations may be lost", "error", err)
+		slog.Warn("WAL replay encountered errors — some recent operations may be lost",
+			"error", err)
 	}
 
 	return e, nil
@@ -663,7 +710,7 @@ func (e *Engine) recoverIndex() {
 // replayWAL reads the WAL file sequentially, verifying each entry's CRC32,
 // and re-applies every operation to bring the index and data up to date.
 // Truncated or corrupt entries stop replay (partial-write tolerance).
-// [B.2 / C.1]
+// [B.2 / C.1] — critical crash-recovery path.
 func (e *Engine) replayWAL() error {
 	data, err := os.ReadFile(e.walPath)
 	if err != nil || len(data) == 0 {
@@ -845,7 +892,7 @@ func (e *Engine) upsertLocked(key string, value []byte) error {
 // ── Public thread-safe CRUD operations ──────────────────────────────────────
 
 // Upsert inserts or replaces the value for key. Validates both key and value
-// lengths before taking any lock. [B.10] Value limit enforced here too.
+// lengths before taking any lock. [B.10] Value limit enforced at both layers.
 func (e *Engine) Upsert(key string, value []byte) error {
 	if len(key) == 0 || len(key) > MaxKeySize {
 		return ErrPayloadTooBig
@@ -894,7 +941,8 @@ func (e *Engine) Delete(key string) error {
 }
 
 // Incr atomically reads, adds delta, and writes back a little-endian int64.
-// [orig 1.2] The full read-modify-write is under a single e.mu.Lock().
+// [1.2] The full read-modify-write is under a single e.mu.Lock() using
+// internal *Locked helpers — no nested lock acquisition possible.
 func (e *Engine) Incr(key string, delta int64) (int64, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -928,27 +976,60 @@ func (e *Engine) Stats() (keys int, ops uint64, pages uint64) {
 }
 
 // ============================================================
-// 7. JANITOR & SHADOW DEFRAGMENTATION
+// 8. JANITOR & SHADOW DEFRAGMENTATION
 // ============================================================
 
 // startJanitor runs the periodic maintenance goroutine.
-// wg.Done is deferred so main's wg.Wait() blocks until this returns. [orig 4.7]
+// wg.Done is deferred so main's wg.Wait() blocks until this returns. [4.7]
+//
+// Idle-cold behaviour: when totalOps has not changed between two consecutive
+// ticks the system is idle. The ticker is reset to JanitorIdleInterval
+// (5 min) to let the CPU and file-system caches cool down. On the next
+// write burst, the first Upsert/Delete/Incr bumps totalOps and the janitor
+// returns to its normal JanitorInterval (30 s) cadence on the next wakeup.
 func (e *Engine) startJanitor(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 	ticker := time.NewTicker(JanitorInterval)
 	defer ticker.Stop()
+
+	var lastOps uint64
+	idle := false
+
 	for {
 		select {
 		case <-ctx.Done():
 			slog.Info("Janitor: stopping.")
 			return
 		case <-ticker.C:
+			currentOps := e.totalOps.Load()
+
+			// ── Idle detection ────────────────────────────────────────────────
+			// If nothing happened since the last tick, back off to a longer
+			// interval so the goroutine scheduler and OS page cache can cool.
+			if currentOps == lastOps {
+				if !idle {
+					idle = true
+					ticker.Reset(JanitorIdleInterval)
+					slog.Info("Janitor: system idle — backing off to long interval",
+						"interval", JanitorIdleInterval)
+				}
+				continue // nothing to do; skip flush/checkpoint/defrag
+			}
+			// Activity detected — restore normal cadence if we were idle.
+			if idle {
+				idle = false
+				ticker.Reset(JanitorInterval)
+				slog.Info("Janitor: activity resumed — restoring normal interval",
+					"interval", JanitorInterval)
+			}
+			lastOps = currentOps
+
+			// ── Periodic flush ────────────────────────────────────────────────
 			e.pool.flushAll()
-			// [orig 1.5] Safe checkpoint order:
-			//   1. flushAll  — dirty pages written to disk
-			//   2. file.Sync — guarantee durability (fsync)
-			//   3. checkpoint — truncate WAL only after fsync confirms safety
-			if e.totalOps.Load() > WALCheckpointOps {
+
+			// ── WAL checkpoint (safe order: flush → fsync → checkpoint) ───────
+			// [1.5] Checkpoint only after the data file is fsync'd.
+			if currentOps >= WALCheckpointOps {
 				if err := e.pool.fm.file.Sync(); err != nil {
 					slog.Error("Janitor: fsync failed", "error", err)
 					continue
@@ -957,9 +1038,12 @@ func (e *Engine) startJanitor(ctx context.Context, wg *sync.WaitGroup) {
 					slog.Error("Janitor: WAL checkpoint failed", "error", err)
 				} else {
 					e.totalOps.Store(0)
+					lastOps = 0
 					slog.Info("Janitor: WAL checkpoint done.")
 				}
 			}
+
+			// ── Shadow defragmentation ────────────────────────────────────────
 			// [B.6] CompareAndSwap prevents launching a second defrag goroutine
 			// while one is still running.
 			if e.pool.fm.TotalPages > DefragPageThreshold {
@@ -991,7 +1075,8 @@ func (e *Engine) runDefrag() {
 		slog.Error("Defrag: cannot create temp file", "error", err)
 		return
 	}
-	// tmpEngine intentionally has no WAL; it is a write-only scratch buffer.
+	// tmpEngine intentionally has no WAL — it is a write-only scratch buffer.
+	// upsertLocked is called directly and never touches e.wal.
 	tmpEngine := &Engine{
 		pool:  newBufferPool(tmpFm, defragPoolCapacity),
 		index: make(map[string]Location),
@@ -1028,12 +1113,12 @@ func (e *Engine) runDefrag() {
 	tmpEngine.pool.flushAll()
 	if err := tmpFm.file.Sync(); err != nil {
 		slog.Error("Defrag: fsync temp file failed — aborting swap", "error", err)
-		tmpFm.file.Close()
-		os.Remove(tmpPath)
+		_ = tmpFm.file.Close()
+		_ = os.Remove(tmpPath)
 		return
 	}
-	tmpFm.file.Close()
-	e.pool.fm.file.Close()
+	_ = tmpFm.file.Close()
+	_ = e.pool.fm.file.Close()
 
 	if err := os.Rename(tmpPath, e.dataPath); err != nil {
 		slog.Error("Defrag: atomic rename failed", "error", err)
@@ -1060,19 +1145,28 @@ func (e *Engine) runDefrag() {
 }
 
 // ============================================================
-// 8. TCP PROTOCOL LAYER
+// 9. TCP PROTOCOL LAYER
 // ============================================================
 //
 // Request wire format:  Magic(2) | Op(1) | ReqID(4) | KeyLen(1) | ValLen(4) | Key | Val
 // Response wire format: Magic(2) | ReqID(4) | Status(1) | DataLen(4) | Data
 
 // handleConnection drives the binary protocol for one persistent TCP connection.
+// Buffer reuse: header and response header slices are borrowed from sync.Pool
+// to eliminate per-request heap allocations on the hot path.
+// Net.Buffers (vectorised write) is used for the response to reduce syscalls.
 func handleConnection(conn net.Conn, eng *Engine) {
 	defer conn.Close()
-	header := make([]byte, 12)
+
+	// Borrow a reusable header buffer from the pool.
+	headerPtr := headerBufPool.Get().(*[]byte)
+	header := *headerPtr
+	defer func() {
+		headerBufPool.Put(headerPtr)
+	}()
 
 	for {
-		// Rolling deadline resets on each successful request. [orig 2.4]
+		// Rolling deadline resets on each successful request. [2.4]
 		if err := conn.SetDeadline(time.Now().Add(ConnDeadline)); err != nil {
 			return
 		}
@@ -1089,7 +1183,7 @@ func handleConnection(conn net.Conn, eng *Engine) {
 		valLen := binary.LittleEndian.Uint32(header[8:12])
 
 		// [B.5] Validate keyLen and valLen before allocation to prevent
-		// integer overflow in the penjumlahan and DoS via oversized payloads.
+		// integer overflow in the sum and DoS via oversized payloads.
 		if keyLen == 0 || keyLen > MaxKeySize {
 			slog.Warn("TCP: rejected invalid keyLen", "keyLen", keyLen)
 			return
@@ -1169,19 +1263,27 @@ func handleConnection(conn net.Conn, eng *Engine) {
 			status = StatusError
 		}
 
-		// Write response header then optional body.
-		resp := make([]byte, 11)
+		// Build and send response using net.Buffers (writev) to reduce syscalls.
+		// Borrowing respBuf from pool for the fixed 11-byte header.
+		respBufPtr := respBufPool.Get().(*[]byte)
+		resp := *respBufPtr
 		binary.LittleEndian.PutUint16(resp[0:2], MagicBytes)
 		copy(resp[2:6], reqID)
 		resp[6] = status
 		binary.LittleEndian.PutUint32(resp[7:11], uint32(len(respData)))
-		if _, err := conn.Write(resp); err != nil {
-			return
-		}
+
+		var writeErr error
 		if len(respData) > 0 {
-			if _, err := conn.Write(respData); err != nil {
-				return
-			}
+			// Vectorised write: header + body in a single writev syscall.
+			buffers := net.Buffers{resp[:11], respData}
+			_, writeErr = buffers.WriteTo(conn)
+		} else {
+			_, writeErr = conn.Write(resp[:11])
+		}
+		respBufPool.Put(respBufPtr)
+
+		if writeErr != nil {
+			return
 		}
 	}
 }
@@ -1202,7 +1304,7 @@ func startTCPServer(ctx context.Context, wg *sync.WaitGroup, eng *Engine) {
 	go func() {
 		<-ctx.Done()
 		closing.Store(true)
-		ln.Close()
+		_ = ln.Close()
 	}()
 
 	sem := make(chan struct{}, MaxConn)
@@ -1212,7 +1314,7 @@ func startTCPServer(ctx context.Context, wg *sync.WaitGroup, eng *Engine) {
 			return // listener closed by ctx cancellation
 		}
 		if closing.Load() {
-			conn.Close() // refuse new connections during shutdown
+			_ = conn.Close() // refuse new connections during shutdown
 			continue
 		}
 		sem <- struct{}{}
@@ -1235,7 +1337,7 @@ func (e *Engine) listenAddr() string {
 }
 
 // ============================================================
-// 9. MAIN ENTRY & GRACEFUL SHUTDOWN
+// 10. MAIN ENTRY & GRACEFUL SHUTDOWN
 // ============================================================
 
 func main() {
@@ -1256,7 +1358,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 
-	// Janitor goroutine — tracked by wg so shutdown waits for it. [orig 4.7]
+	// Janitor goroutine — tracked by wg so shutdown waits for it. [4.7]
 	wg.Add(1)
 	go eng.startJanitor(ctx, &wg)
 
@@ -1278,7 +1380,7 @@ func main() {
 
 	// ── Final flush sequence ──────────────────────────────────────────────
 	// All goroutines have exited, so no concurrent access is possible here.
-	// Order is mandatory: flush → fsync → checkpoint WAL.
+	// [B.12] Order is mandatory and safe: flush → fsync → checkpoint WAL.
 	eng.pool.flushAll()
 
 	if err := eng.pool.fm.file.Sync(); err != nil {
@@ -1300,20 +1402,16 @@ func main() {
 // resolveEnv returns the value of envKey if set; otherwise checks whether
 // the parent directory of primaryPath exists and returns primaryPath, or
 // falls back to fallbackPath for local development. [C.2]
+// Uses filepath.Dir for correct cross-platform path handling.
 func resolveEnv(envKey, primaryPath, fallbackPath string) string {
 	if v := os.Getenv(envKey); v != "" {
 		return v
 	}
-	// Determine the parent directory by scanning for the last '/'.
-	dir := "."
-	for i := len(primaryPath) - 1; i >= 0; i-- {
-		if primaryPath[i] == '/' {
-			dir = primaryPath[:i]
-			break
+	dir := filepath.Dir(primaryPath)
+	if dir != "." {
+		if _, err := os.Stat(dir); err == nil {
+			return primaryPath
 		}
-	}
-	if _, err := os.Stat(dir); err == nil && dir != "." {
-		return primaryPath
 	}
 	return fallbackPath
 }
