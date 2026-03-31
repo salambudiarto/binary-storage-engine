@@ -6,17 +6,27 @@
 //   - Write-Ahead Log (WAL) with CRC32 per-entry checksums and crash replay
 //   - Shadow defragmentation (copy-on-write, atomic file swap)
 //   - Binary TCP protocol with semaphore-limited connection pool
-//   - Graceful shutdown: context-cancel → wg.Wait → final flush → fsync → checkpoint
-//   - Idle-aware janitor: ticker fires only when there is actual work to do
+//   - Graceful shutdown: context-cancel → wg.Wait → final flush → fsync → checkpoint → index snapshot
+//   - Idle-aware resource management: shrinkPool + shrinkIndex + saveIndexCheckpoint on idle
 //   - sync.Pool for reusable header/response buffers (zero-alloc hot path)
 //
-// Compliance matrix (evaluasi_1 + evaluasi_2):
+// Compliance matrix (evaluasi_1 + evaluasi_2 + evaluasi_5):
 //   All 22 items from evaluasi_1 addressed.
 //   All 13 independent findings from evaluasi_2 (B.1–B.13, C.1–C.3) addressed.
+//   All 10 TODOs from evaluasi_5 (idle-aware resource optimisation) addressed.
 //
-// Additional hardening beyond both evaluations:
-//   - sync.Pool for header/response byte-slice reuse (reduces GC pressure)
-//   - Idle-cold janitor: backs off to long sleep when no ops arrive
+// Idle resource optimisation (evaluasi_5):
+//   - BSENGINE_MEM_LIMIT_MB: soft RSS cap via runtime/debug.SetMemoryLimit (TODO-01)
+//   - BSENGINE_GOGC: GC aggressiveness tuning, default 50 (TODO-08)
+//   - IdleTimeout/IdleShrinkInterval/MinCachePages constants (TODO-02)
+//   - lastOpTime atomic.Int64 for time-based idle detection (TODO-04)
+//   - shrinkPool(): evicts unpinned pages → GC → FreeOSMemory in background (TODO-03)
+//   - Janitor idle path: shrinkPool + shrinkIndex + saveIndexCheckpoint (TODO-05/06/07)
+//   - saveIndexCheckpoint / loadIndexCheckpoint: O(1) startup on warm restart (TODO-07)
+//   - OpEvict (0x07): manual cache eviction trigger via TCP (TODO-09)
+//   - Stats() exposes cachedPages + idleSecs for observability (TODO-10)
+//
+// Additional hardening beyond all evaluations:
 //   - Vectorised response write (net.Buffers) to reduce syscall count
 //   - readGlobalHeader validates magic string and file version
 //   - TotalPages update guarded: only written when truly a new high-water mark
@@ -37,6 +47,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -83,6 +96,15 @@ const (
 	WALCheckpointOps    = 10_000
 	DefragPageThreshold = 500
 
+	// Idle resource management
+	IdleTimeout        = 5 * time.Minute // duration without ops before engine enters idle mode
+	IdleShrinkInterval = 1 * time.Minute // how often shrink is attempted while idle
+	MinCachePages      = 64              // minimum pages retained in pool when idle
+	// 64 × 4096 = 256 KB — small enough for resource-constrained env, enough for hot pages
+
+	// Index checkpoint
+	IndexCheckpointFile = "bsengine.idx" // index snapshot file, same dir as data file
+
 	// Network
 	ConnDeadline = 60 * time.Second
 
@@ -98,6 +120,7 @@ const (
 	OpIncr   byte = 0x04
 	OpPing   byte = 0x05
 	OpStats  byte = 0x06 // [C.3] lightweight health / metrics opcode
+	OpEvict  byte = 0x07 // force shrink pool + index + GC from external trigger
 )
 
 // Status codes returned by the server in the TCP response header.
@@ -612,6 +635,49 @@ func (bp *BufferPool) flushAll() {
 	}
 }
 
+// shrinkPool evicts unpinned pages from the buffer pool until the number
+// of cached pages is at or below MinCachePages. It then forces a GC cycle
+// and returns freed memory to the OS. Safe to call concurrently — acquires
+// bp.mu internally.
+func (bp *BufferPool) shrinkPool() {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+
+	for len(bp.pages) > MinCachePages {
+		evicted := false
+		for e := bp.lru.Back(); e != nil; e = e.Prev() {
+			cp := e.Value.(*cachedPage)
+			if cp.PinCount > 0 {
+				continue
+			}
+			if cp.Dirty {
+				if err := bp.fm.writePage(cp.Page.Header.PageID, cp.Page); err != nil {
+					slog.Warn("shrinkPool: failed to flush dirty page",
+						"pageID", cp.Page.Header.PageID, "error", err)
+					continue
+				}
+			}
+			delete(bp.pages, cp.Page.Header.PageID)
+			bp.lru.Remove(e)
+			evicted = true
+			break
+		}
+		if !evicted {
+			break // all pages are pinned — cannot evict further
+		}
+	}
+
+	// Release lock before GC so other goroutines are not stalled during
+	// the stop-the-world pause. GC and FreeOSMemory run in a background
+	// goroutine so the caller returns immediately.
+	remaining := len(bp.pages)
+	go func() {
+		runtime.GC()
+		debug.FreeOSMemory()
+		slog.Info("shrinkPool: memory returned to OS", "remainingPages", remaining)
+	}()
+}
+
 // ============================================================
 // 7. STORAGE ENGINE CORE
 // ============================================================
@@ -632,7 +698,8 @@ type Engine struct {
 	// and runDefrag (separate goroutine with its own lock acquisition sequence).
 	activePageID  atomic.Uint64
 	totalOps      atomic.Uint64
-	defragRunning atomic.Bool // [B.6] prevents concurrent defrag runs
+	defragRunning atomic.Bool  // [B.6] prevents concurrent defrag runs
+	lastOpTime    atomic.Int64 // Unix nanosecond timestamp of the last CRUD operation
 }
 
 // newEngine opens the data and WAL files, rebuilds the index from disk,
@@ -661,8 +728,16 @@ func newEngine(dataPath, walPath string) (*Engine, error) {
 	}
 	e.activePageID.Store(startPage)
 
-	// Phase 1: full disk scan to rebuild the index from committed pages.
-	e.recoverIndex()
+	// Phase 1: load index from checkpoint if available, otherwise full disk scan.
+	if ok, err := e.loadIndexCheckpoint(); err != nil {
+		slog.Warn("Index checkpoint corrupted — falling back to full scan", "error", err)
+		e.recoverIndex()
+	} else if !ok {
+		slog.Info("No index checkpoint found — performing full disk scan")
+		e.recoverIndex()
+	} else {
+		slog.Info("Index loaded from checkpoint — skipping full disk scan")
+	}
 
 	// Phase 2: replay WAL to recover operations that were logged but not yet
 	// flushed to the data file before the last crash. [B.2 / C.1]
@@ -905,6 +980,7 @@ func (e *Engine) Upsert(key string, value []byte) error {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.lastOpTime.Store(time.Now().UnixNano())
 	if err := e.wal.append(OpUpsert, key, value); err != nil {
 		return err
 	}
@@ -916,6 +992,7 @@ func (e *Engine) Upsert(key string, value []byte) error {
 func (e *Engine) View(key string) ([]byte, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
+	e.lastOpTime.Store(time.Now().UnixNano())
 	loc, ok := e.index[key]
 	if !ok {
 		return nil, ErrNotFound
@@ -927,6 +1004,7 @@ func (e *Engine) View(key string) ([]byte, error) {
 func (e *Engine) Delete(key string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.lastOpTime.Store(time.Now().UnixNano())
 	if err := e.wal.append(OpDelete, key, nil); err != nil {
 		return err
 	}
@@ -946,6 +1024,7 @@ func (e *Engine) Delete(key string) error {
 func (e *Engine) Incr(key string, delta int64) (int64, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.lastOpTime.Store(time.Now().UnixNano())
 
 	var current int64
 	if loc, ok := e.index[key]; ok {
@@ -966,13 +1045,148 @@ func (e *Engine) Incr(key string, delta int64) (int64, error) {
 }
 
 // Stats returns a snapshot of runtime metrics for the OpStats TCP opcode. [C.3]
-func (e *Engine) Stats() (keys int, ops uint64, pages uint64) {
+func (e *Engine) Stats() (keys int, ops uint64, pages uint64, cachedPages int, idleSecs int64) {
 	e.mu.RLock()
 	keys = len(e.index)
 	e.mu.RUnlock()
 	ops = e.totalOps.Load()
 	pages = e.pool.fm.TotalPages
+
+	e.pool.mu.Lock()
+	cachedPages = len(e.pool.pages)
+	e.pool.mu.Unlock()
+
+	lastOp := e.lastOpTime.Load()
+	if lastOp > 0 {
+		idleSecs = int64(time.Since(time.Unix(0, lastOp)).Seconds())
+	}
 	return
+}
+
+// shrinkIndex rebuilds the index map to reclaim memory from deleted keys.
+// Go maps do not shrink their backing arrays after deletions — this method
+// allocates a fresh map and copies only live entries, allowing the old
+// backing array to be garbage-collected.
+//
+// Must be called while holding e.mu.Lock(). Typically invoked by the janitor
+// during idle mode transition.
+func (e *Engine) shrinkIndex() {
+	before := len(e.index)
+	if before == 0 {
+		return
+	}
+	fresh := make(map[string]Location, before)
+	for k, v := range e.index {
+		fresh[k] = v
+	}
+	e.index = fresh
+	slog.Info("shrinkIndex: index map rebuilt", "keys", before)
+}
+
+// saveIndexCheckpoint serialises the current index to disk so that the next
+// startup can skip the full page scan. Called by the janitor during idle
+// transitions and during graceful shutdown.
+// Requires e.mu.RLock() to be held by the caller (or Lock — either is fine).
+func (e *Engine) saveIndexCheckpoint() error {
+	path := e.dataPath[:len(e.dataPath)-len(filepath.Ext(e.dataPath))] + ".idx"
+
+	f, err := os.OpenFile(path+".tmp", os.O_RDWR|os.O_CREATE|os.O_TRUNC, FilePermission)
+	if err != nil {
+		return fmt.Errorf("saveIndexCheckpoint: open tmp: %w", err)
+	}
+
+	magic := [8]byte{'B', 'S', 'E', 'I', 'D', 'X', '0', '1'}
+	header := make([]byte, 16)
+	copy(header[0:8], magic[:])
+	binary.LittleEndian.PutUint64(header[8:16], uint64(len(e.index)))
+	if _, err := f.Write(header); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("saveIndexCheckpoint: write header: %w", err)
+	}
+
+	buf := make([]byte, 0, 4096)
+	for key, loc := range e.index {
+		keyBytes := []byte(key)
+		entry := make([]byte, 2+len(keyBytes)+8+2)
+		binary.LittleEndian.PutUint16(entry[0:2], uint16(len(keyBytes)))
+		copy(entry[2:], keyBytes)
+		binary.LittleEndian.PutUint64(entry[2+len(keyBytes):], loc.PageID)
+		binary.LittleEndian.PutUint16(entry[2+len(keyBytes)+8:], loc.SlotID)
+		buf = append(buf, entry...)
+		if len(buf) >= 4096 {
+			if _, err := f.Write(buf); err != nil {
+				_ = f.Close()
+				return fmt.Errorf("saveIndexCheckpoint: write entries: %w", err)
+			}
+			buf = buf[:0]
+		}
+	}
+	if len(buf) > 0 {
+		if _, err := f.Write(buf); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("saveIndexCheckpoint: write final entries: %w", err)
+		}
+	}
+
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	_ = f.Close()
+
+	// Atomic rename: .tmp → final to prevent partial-write corruption.
+	if err := os.Rename(path+".tmp", path); err != nil {
+		return fmt.Errorf("saveIndexCheckpoint: rename: %w", err)
+	}
+	slog.Info("saveIndexCheckpoint: written", "keys", len(e.index), "path", path)
+	return nil
+}
+
+// loadIndexCheckpoint attempts to load the index from a checkpoint file.
+// Returns (true, nil) if successfully loaded, (false, nil) if no checkpoint
+// exists (caller should fall back to recoverIndex), or (false, err) on corruption.
+func (e *Engine) loadIndexCheckpoint() (bool, error) {
+	path := e.dataPath[:len(e.dataPath)-len(filepath.Ext(e.dataPath))] + ".idx"
+
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil // no checkpoint — normal on fresh install
+	}
+	if err != nil {
+		return false, fmt.Errorf("loadIndexCheckpoint: read: %w", err)
+	}
+	if len(data) < 16 {
+		return false, fmt.Errorf("loadIndexCheckpoint: file too short")
+	}
+
+	magic := [8]byte{'B', 'S', 'E', 'I', 'D', 'X', '0', '1'}
+	if [8]byte(data[0:8]) != magic {
+		return false, fmt.Errorf("loadIndexCheckpoint: bad magic")
+	}
+
+	count := binary.LittleEndian.Uint64(data[8:16])
+	offset := 16
+	e.index = make(map[string]Location, count)
+
+	for i := uint64(0); i < count; i++ {
+		if offset+2 > len(data) {
+			return false, fmt.Errorf("loadIndexCheckpoint: truncated at entry %d", i)
+		}
+		keyLen := int(binary.LittleEndian.Uint16(data[offset:]))
+		offset += 2
+		if offset+keyLen+10 > len(data) {
+			return false, fmt.Errorf("loadIndexCheckpoint: truncated key at entry %d", i)
+		}
+		key := string(data[offset : offset+keyLen])
+		offset += keyLen
+		pageID := binary.LittleEndian.Uint64(data[offset:])
+		slotID := binary.LittleEndian.Uint16(data[offset+8:])
+		offset += 10
+		e.index[key] = Location{PageID: pageID, SlotID: slotID}
+	}
+
+	slog.Info("loadIndexCheckpoint: loaded", "keys", len(e.index))
+	return true, nil
 }
 
 // ============================================================
@@ -1001,35 +1215,57 @@ func (e *Engine) startJanitor(ctx context.Context, wg *sync.WaitGroup) {
 			slog.Info("Janitor: stopping.")
 			return
 		case <-ticker.C:
-			currentOps := e.totalOps.Load()
+			currOps := e.totalOps.Load()
 
-			// ── Idle detection ────────────────────────────────────────────────
-			// If nothing happened since the last tick, back off to a longer
-			// interval so the goroutine scheduler and OS page cache can cool.
-			if currentOps == lastOps {
-				if !idle {
-					idle = true
-					ticker.Reset(JanitorIdleInterval)
-					slog.Info("Janitor: system idle — backing off to long interval",
-						"interval", JanitorIdleInterval)
+			// ── Idle detection (time-based + ops-based) ───────────────────────
+			lastOp := e.lastOpTime.Load()
+			idleDuration := time.Duration(0)
+			if lastOp > 0 {
+				idleDuration = time.Since(time.Unix(0, lastOp))
+			}
+
+			isNowIdle := (currOps == lastOps) || (lastOp > 0 && idleDuration >= IdleTimeout)
+
+			if isNowIdle && !idle {
+				// Transition into idle mode: shrink pool, rebuild index map,
+				// persist index checkpoint so restart is fast.
+				idle = true
+				slog.Info("Engine entering idle mode — shrinking buffer pool and index",
+					"idleDuration", idleDuration.Round(time.Second))
+				e.pool.shrinkPool()
+
+				// shrinkIndex and saveIndexCheckpoint require the write lock.
+				e.mu.Lock()
+				e.shrinkIndex()
+				if err := e.saveIndexCheckpoint(); err != nil {
+					slog.Warn("Idle: failed to save index checkpoint", "error", err)
 				}
-				continue // nothing to do; skip flush/checkpoint/defrag
-			}
-			// Activity detected — restore normal cadence if we were idle.
-			if idle {
+				e.mu.Unlock()
+
+				ticker.Reset(IdleShrinkInterval)
+				lastOps = currOps
+				continue // skip flush/checkpoint/defrag on the idle transition tick
+			} else if !isNowIdle && idle {
+				// Activity resumed — restore normal janitor cadence.
 				idle = false
+				slog.Info("Engine resuming from idle mode")
 				ticker.Reset(JanitorInterval)
-				slog.Info("Janitor: activity resumed — restoring normal interval",
-					"interval", JanitorInterval)
 			}
-			lastOps = currentOps
+
+			// If still idle (no state change), nothing to do.
+			if idle {
+				lastOps = currOps
+				continue
+			}
+
+			lastOps = currOps
 
 			// ── Periodic flush ────────────────────────────────────────────────
 			e.pool.flushAll()
 
 			// ── WAL checkpoint (safe order: flush → fsync → checkpoint) ───────
 			// [1.5] Checkpoint only after the data file is fsync'd.
-			if currentOps >= WALCheckpointOps {
+			if currOps >= WALCheckpointOps {
 				if err := e.pool.fm.file.Sync(); err != nil {
 					slog.Error("Janitor: fsync failed", "error", err)
 					continue
@@ -1252,12 +1488,23 @@ func handleConnection(conn net.Conn, eng *Engine) {
 			}
 
 		case OpStats: // [C.3] lightweight health opcode
-			keys, ops, pages := eng.Stats()
-			// Response: keys(8) + ops(8) + pages(8) = 24 bytes
-			respData = make([]byte, 24)
+			keys, ops, pages, cachedPages, idleSecs := eng.Stats()
+			// Response: keys(8) + ops(8) + pages(8) + cachedPages(4) + idleSecs(8) = 36 bytes
+			respData = make([]byte, 36)
 			binary.LittleEndian.PutUint64(respData[0:8], uint64(keys))
 			binary.LittleEndian.PutUint64(respData[8:16], ops)
 			binary.LittleEndian.PutUint64(respData[16:24], pages)
+			binary.LittleEndian.PutUint32(respData[24:28], uint32(cachedPages))
+			binary.LittleEndian.PutUint64(respData[28:36], uint64(idleSecs))
+
+		case OpEvict: // manual cache eviction trigger for operators / orchestrators
+			go func() {
+				eng.pool.shrinkPool()
+				eng.mu.Lock()
+				eng.shrinkIndex()
+				eng.mu.Unlock()
+			}()
+			// Respond immediately — eviction runs in background.
 
 		default:
 			status = StatusError
@@ -1343,6 +1590,31 @@ func (e *Engine) listenAddr() string {
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
+	// ── TODO-01: Soft memory cap via GOMEMLIMIT ───────────────────────────────
+	// Signals the Go runtime to return memory to the OS more aggressively when
+	// the process approaches this limit. Without this, RSS stays at peak usage
+	// even when the engine is idle (GOGC=100 default holds heap as reservation).
+	if limitMB := os.Getenv("BSENGINE_MEM_LIMIT_MB"); limitMB != "" {
+		if mb, err := strconv.ParseInt(limitMB, 10, 64); err == nil && mb > 0 {
+			debug.SetMemoryLimit(mb * 1024 * 1024)
+			slog.Info("Memory limit set", "limitMB", mb)
+		}
+	}
+
+	// ── TODO-08: GC aggressiveness tuning ────────────────────────────────────
+	// Lower GOGC → GC fires more often → heap stays smaller.
+	// Default Go value is 100 (GC when heap doubles). We default to 50 for
+	// resource-constrained environments; operators can override via env var.
+	// Trade-off: slightly higher CPU during GC cycles, significantly lower RSS.
+	if gogc := os.Getenv("BSENGINE_GOGC"); gogc != "" {
+		if v, err := strconv.Atoi(gogc); err == nil && v > 0 {
+			debug.SetGCPercent(v)
+			slog.Info("GC percent set", "GOGC", v)
+		}
+	} else {
+		debug.SetGCPercent(50) // recommended default for embedded / resource-constrained use
+	}
+
 	// [C.2] Resolve data paths from environment variables, with fallbacks.
 	dataPath := resolveEnv("BSENGINE_DATA_PATH", "/data/data.bin", "data.bin")
 	walPath := resolveEnv("BSENGINE_WAL_PATH", "/data/wal.bin", "wal.bin")
@@ -1389,6 +1661,15 @@ func main() {
 	if err := eng.wal.checkpoint(); err != nil {
 		slog.Error("Shutdown: WAL checkpoint failed", "error", err)
 	}
+
+	// ── TODO-07: Persist index checkpoint so next startup skips full scan ─────
+	// RLock is safe here — all goroutines have already exited via wg.Wait().
+	eng.mu.RLock()
+	if err := eng.saveIndexCheckpoint(); err != nil {
+		slog.Error("Shutdown: failed to save index checkpoint", "error", err)
+	}
+	eng.mu.RUnlock()
+
 	if err := eng.pool.fm.file.Close(); err != nil {
 		slog.Error("Shutdown: data file close failed", "error", err)
 	}
