@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
-	"hash/fnv"
 	"io"
 	"log/slog"
 	"net"
@@ -19,13 +18,14 @@ import (
 )
 
 // ==========================================
-// 1. KONSTANTA & KONFIGURASI SISTEM
+// 1. CONSTANTS & SYSTEM CONFIGURATION
 // ==========================================
 const (
 	PageSize       = 4096
 	PageHeaderSize = 32
 	MaxChunkSize   = 64
 	MaxKeySize     = 64
+	MaxValueSize   = 10 * 1024 * 1024 // 10MB max payload (DoS protection)
 	SlotSize       = 4
 	PoolSizeMB     = 64
 	MaxCachePages  = (PoolSizeMB * 1024 * 1024) / PageSize // 16384 pages
@@ -33,8 +33,23 @@ const (
 	Port    = ":7070"
 	MaxConn = 100
 
+	FileVersion    uint16 = 1
+	FilePermission        = 0600 // Owner-only read/write (was 0666)
+
 	MagicBytes  uint16 = 0xBE57
 	GlobalMagic        = "BSENGINE"
+
+	// Janitor intervals & thresholds
+	JanitorInterval     = 30 * time.Second
+	WALCheckpointOps    = 10000
+	DefragPageThreshold = 500
+
+	// Connection deadline
+	ConnReadDeadline = 60 * time.Second
+
+	// WAL record structure sizes
+	// LSN(8) + Op(1) + KeyLen(2) + ValLen(4) + Key + Val + Checksum(4)
+	WALHeaderSize = 15
 )
 
 // Opcodes & Status
@@ -60,16 +75,18 @@ const (
 )
 
 var (
-	ErrPageFull      = errors.New("engine: page full")
-	ErrNotFound      = errors.New("engine: key not found")
-	ErrInvalidRecord = errors.New("engine: invalid record")
-	ErrSlotNotFound  = errors.New("engine: slot not found")
-	ErrPayloadTooBig = errors.New("engine: key exceeds limits")
+	ErrPageFull         = errors.New("engine: page full")
+	ErrNotFound         = errors.New("engine: key not found")
+	ErrInvalidRecord    = errors.New("engine: invalid record")
+	ErrSlotNotFound     = errors.New("engine: slot not found")
+	ErrPayloadTooBig    = errors.New("engine: key or value exceeds limits")
+	ErrChecksumMismatch = errors.New("engine: page checksum mismatch")
 )
 
 // ==========================================
 // 2. CORE STRUCTS & BINARY ENCODING
 // ==========================================
+
 type Location struct {
 	PageID uint64
 	SlotID uint16
@@ -97,17 +114,20 @@ type Page struct {
 	Buffer [PageSize]byte
 }
 
+// NewPage initializes a new in-memory page with the given ID.
 func NewPage(pageID uint64) *Page {
 	p := &Page{}
 	p.Header.PageID = pageID
 	p.Header.PageType = 1
 	p.Header.LowerOffset = PageHeaderSize
 	p.Header.UpperOffset = PageSize
-	p.SyncHeaderToBuffer()
+	p.syncHeaderToBuffer()
 	return p
 }
 
-func (p *Page) SyncHeaderToBuffer() {
+// syncHeaderToBuffer serializes the PageHeader struct into the raw Buffer and
+// recalculates the CRC32 checksum. Only call this when preparing to write to disk.
+func (p *Page) syncHeaderToBuffer() {
 	binary.LittleEndian.PutUint64(p.Buffer[0:8], p.Header.PageID)
 	binary.LittleEndian.PutUint16(p.Buffer[8:10], p.Header.PageType)
 	binary.LittleEndian.PutUint16(p.Buffer[10:12], p.Header.SlotCount)
@@ -118,7 +138,19 @@ func (p *Page) SyncHeaderToBuffer() {
 	binary.LittleEndian.PutUint32(p.Buffer[18:22], p.Header.Checksum)
 }
 
-func EncodeRecord(rec *LinkedRecord) ([]byte, error) {
+// verifyChecksum recomputes the CRC32 and compares against the stored value.
+// Returns ErrChecksumMismatch if they differ (indicates disk corruption).
+func (p *Page) verifyChecksum() error {
+	stored := binary.LittleEndian.Uint32(p.Buffer[18:22])
+	computed := crc32.ChecksumIEEE(p.Buffer[0:18])
+	if stored != computed {
+		return ErrChecksumMismatch
+	}
+	return nil
+}
+
+// encodeRecord serializes a LinkedRecord into a byte slice.
+func encodeRecord(rec *LinkedRecord) []byte {
 	isHead := rec.Flags == FlagHead || rec.Flags == FlagHeadSingle
 	size := 12 + len(rec.Data)
 	if isHead {
@@ -139,10 +171,12 @@ func EncodeRecord(rec *LinkedRecord) ([]byte, error) {
 	buf[offset] = byte(len(rec.Data))
 	offset++
 	copy(buf[offset:], rec.Data)
-	return buf, nil
+	return buf
 }
 
-func DecodeRecord(data []byte) (*LinkedRecord, error) {
+// decodeRecord deserializes a byte slice into a LinkedRecord.
+// Returns ErrInvalidRecord if the data is malformed or truncated.
+func decodeRecord(data []byte) (*LinkedRecord, error) {
 	if len(data) < 12 {
 		return nil, ErrInvalidRecord
 	}
@@ -153,21 +187,34 @@ func DecodeRecord(data []byte) (*LinkedRecord, error) {
 	offset := 11
 	isHead := rec.Flags == FlagHead || rec.Flags == FlagHeadSingle
 	if isHead {
+		if offset >= len(data) {
+			return nil, ErrInvalidRecord
+		}
 		keyLen := int(data[offset])
 		offset++
+		if offset+keyLen > len(data) {
+			return nil, ErrInvalidRecord
+		}
 		rec.Key = make([]byte, keyLen)
 		copy(rec.Key, data[offset:offset+keyLen])
 		offset += keyLen
 	}
+	if offset >= len(data) {
+		return nil, ErrInvalidRecord
+	}
 	dataLen := int(data[offset])
 	offset++
+	if offset+dataLen > len(data) {
+		return nil, ErrInvalidRecord
+	}
 	rec.Data = make([]byte, dataLen)
 	copy(rec.Data, data[offset:offset+dataLen])
 	return rec, nil
 }
 
+// InsertRecord writes an encoded record into the page using slotted-page layout.
 func (p *Page) InsertRecord(rec *LinkedRecord) (uint16, error) {
-	encoded, _ := EncodeRecord(rec)
+	encoded := encodeRecord(rec)
 	recSize := uint16(len(encoded))
 	if p.Header.UpperOffset-p.Header.LowerOffset < recSize+SlotSize {
 		return 0, ErrPageFull
@@ -180,137 +227,188 @@ func (p *Page) InsertRecord(rec *LinkedRecord) (uint16, error) {
 	binary.LittleEndian.PutUint16(p.Buffer[p.Header.LowerOffset+2:], recSize)
 	p.Header.LowerOffset += SlotSize
 	p.Header.SlotCount++
-	p.SyncHeaderToBuffer()
+	// Note: syncHeaderToBuffer is called only on WritePage, not on every in-memory mod.
 	return slotID, nil
 }
 
+// GetRecord reads and decodes the record at the given slotID.
 func (p *Page) GetRecord(slotID uint16) (*LinkedRecord, error) {
 	if slotID >= p.Header.SlotCount {
 		return nil, ErrSlotNotFound
 	}
-	slotPos := PageHeaderSize + (slotID * SlotSize)
+	slotPos := uint16(PageHeaderSize) + (slotID * SlotSize)
 	recOffset := binary.LittleEndian.Uint16(p.Buffer[slotPos : slotPos+2])
 	recLen := binary.LittleEndian.Uint16(p.Buffer[slotPos+2 : slotPos+4])
 	if recOffset == 0 || p.Buffer[recOffset] == FlagTombstone {
 		return nil, ErrSlotNotFound
 	}
-	return DecodeRecord(p.Buffer[recOffset : recOffset+recLen])
+	return decodeRecord(p.Buffer[recOffset : recOffset+recLen])
 }
 
+// DeleteRecord marks a slot as tombstoned and tracks fragmented bytes.
 func (p *Page) DeleteRecord(slotID uint16) {
-	slotPos := PageHeaderSize + (slotID * SlotSize)
+	slotPos := uint16(PageHeaderSize) + (slotID * SlotSize)
 	recOffset := binary.LittleEndian.Uint16(p.Buffer[slotPos : slotPos+2])
 	recLen := binary.LittleEndian.Uint16(p.Buffer[slotPos+2 : slotPos+4])
 	if recOffset != 0 && p.Buffer[recOffset] != FlagTombstone {
 		p.Buffer[recOffset] = FlagTombstone
 		p.Header.FragBytes += recLen + SlotSize
-		p.SyncHeaderToBuffer()
 	}
 }
 
 // ==========================================
 // 3. FILE MANAGER & GLOBAL HEADER
 // ==========================================
+
 type FileManager struct {
 	file       *os.File
 	TotalPages uint64
 }
 
+// NewFileManager opens (or creates) the data file and reads/initializes the global header.
 func NewFileManager(path string) (*FileManager, error) {
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, FilePermission)
 	if err != nil {
 		return nil, err
 	}
 
 	fm := &FileManager{file: file}
-	info, _ := file.Stat()
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
 
-	// Jika file baru, inisialisasi Global Header (Page 0)
 	if info.Size() == 0 {
 		fm.TotalPages = 0
-		fm.WriteGlobalHeader()
+		if err := fm.writeGlobalHeader(); err != nil {
+			file.Close()
+			return nil, err
+		}
 	} else {
-		fm.ReadGlobalHeader()
+		if err := fm.readGlobalHeader(); err != nil {
+			file.Close()
+			return nil, err
+		}
 	}
 	return fm, nil
 }
 
-func (fm *FileManager) WriteGlobalHeader() {
+func (fm *FileManager) writeGlobalHeader() error {
 	buf := make([]byte, PageSize)
 	copy(buf[0:8], GlobalMagic)
-	binary.LittleEndian.PutUint16(buf[8:10], 1) // Version
+	binary.LittleEndian.PutUint16(buf[8:10], FileVersion)
 	binary.LittleEndian.PutUint16(buf[10:12], PageSize)
 	binary.LittleEndian.PutUint64(buf[12:20], fm.TotalPages)
-	fm.file.WriteAt(buf, 0) // Page 0
+	_, err := fm.file.WriteAt(buf, 0)
+	return err
 }
 
-func (fm *FileManager) ReadGlobalHeader() {
+func (fm *FileManager) readGlobalHeader() error {
 	buf := make([]byte, 64)
-	fm.file.ReadAt(buf, 0)
+	_, err := fm.file.ReadAt(buf, 0)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
 	if string(buf[0:8]) == GlobalMagic {
 		fm.TotalPages = binary.LittleEndian.Uint64(buf[12:20])
 	}
+	return nil
 }
 
+// ReadPage loads a page from disk into the provided Page struct and parses its header.
 func (fm *FileManager) ReadPage(id uint64, p *Page) error {
 	_, err := fm.file.ReadAt(p.Buffer[:], int64(id)*PageSize)
-	if err == nil {
-		p.Header.PageID = binary.LittleEndian.Uint64(p.Buffer[0:8])
-		p.Header.SlotCount = binary.LittleEndian.Uint16(p.Buffer[10:12])
-		p.Header.LowerOffset = binary.LittleEndian.Uint16(p.Buffer[12:14])
-		p.Header.UpperOffset = binary.LittleEndian.Uint16(p.Buffer[14:16])
-		p.Header.FragBytes = binary.LittleEndian.Uint16(p.Buffer[16:18])
+	if err != nil {
+		return err
 	}
-	return err
+	p.Header.PageID = binary.LittleEndian.Uint64(p.Buffer[0:8])
+	p.Header.SlotCount = binary.LittleEndian.Uint16(p.Buffer[10:12])
+	p.Header.LowerOffset = binary.LittleEndian.Uint16(p.Buffer[12:14])
+	p.Header.UpperOffset = binary.LittleEndian.Uint16(p.Buffer[14:16])
+	p.Header.FragBytes = binary.LittleEndian.Uint16(p.Buffer[16:18])
+
+	// Verify integrity on every read from disk
+	if err := p.verifyChecksum(); err != nil {
+		slog.Error("Checksum mismatch detected", "pageID", id, "error", err)
+		return err
+	}
+	return nil
 }
 
+// WritePage flushes a page to disk, syncing the header and updating TotalPages if needed.
 func (fm *FileManager) WritePage(id uint64, p *Page) error {
-	p.SyncHeaderToBuffer()
+	p.syncHeaderToBuffer()
 	_, err := fm.file.WriteAt(p.Buffer[:], int64(id)*PageSize)
+	if err != nil {
+		return err
+	}
 	if id > fm.TotalPages {
 		fm.TotalPages = id
-		fm.WriteGlobalHeader() // Update total pages di header
+		if err := fm.writeGlobalHeader(); err != nil {
+			return err
+		}
 	}
-	return err
+	return nil
 }
 
 // ==========================================
 // 4. WRITE-AHEAD LOG (WAL)
 // ==========================================
+
 type WAL struct {
 	mu   sync.Mutex
+	lsn  uint64
 	file *os.File
 }
 
-func NewWAL(path string) *WAL {
-	f, _ := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
-	return &WAL{file: f}
+// NewWAL opens (or creates) the WAL file. Returns an error if the file cannot be opened.
+func NewWAL(path string) (*WAL, error) {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, FilePermission)
+	if err != nil {
+		return nil, err
+	}
+	return &WAL{file: f}, nil
 }
 
-func (w *WAL) Append(op byte, key string, val []byte) {
+// Append writes a WAL entry for crash recovery. Calls fsync after each write.
+func (w *WAL) Append(op byte, key string, val []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.lsn++
 	// LSN(8) + Op(1) + KeyLen(2) + ValLen(4) + Key + Val + Checksum(4)
-	buf := make([]byte, 15+len(key)+len(val)+4)
+	buf := make([]byte, WALHeaderSize+len(key)+len(val)+4)
+	binary.LittleEndian.PutUint64(buf[0:8], w.lsn)
 	buf[8] = op
 	binary.LittleEndian.PutUint16(buf[9:11], uint16(len(key)))
 	binary.LittleEndian.PutUint32(buf[11:15], uint32(len(val)))
 	copy(buf[15:], key)
 	copy(buf[15+len(key):], val)
-	w.file.Write(buf)
-	w.file.Sync() // fsync untuk crash safety
+	checksum := crc32.ChecksumIEEE(buf[:WALHeaderSize+len(key)+len(val)])
+	binary.LittleEndian.PutUint32(buf[WALHeaderSize+len(key)+len(val):], checksum)
+
+	if _, err := w.file.Write(buf); err != nil {
+		return err
+	}
+	return w.file.Sync() // fsync for crash safety
 }
 
-func (w *WAL) Checkpoint() {
+// Checkpoint truncates the WAL after all data has been safely flushed to disk.
+// MUST only be called after fm.file.Sync() to guarantee data durability.
+func (w *WAL) Checkpoint() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.file.Truncate(0)
-	w.file.Seek(0, 0)
+	if err := w.file.Truncate(0); err != nil {
+		return err
+	}
+	_, err := w.file.Seek(0, 0)
+	return err
 }
 
 // ==========================================
 // 5. BUFFER POOL (LRU)
 // ==========================================
+
 type CachedPage struct {
 	Page     *Page
 	Dirty    bool
@@ -325,25 +423,37 @@ type BufferPool struct {
 	capacity int
 }
 
-func NewBufferPool(fm *FileManager, cap int) *BufferPool {
-	return &BufferPool{fm: fm, pages: make(map[uint64]*list.Element), lru: list.New(), capacity: cap}
+func NewBufferPool(fm *FileManager, capacity int) *BufferPool {
+	return &BufferPool{
+		fm:       fm,
+		pages:    make(map[uint64]*list.Element),
+		lru:      list.New(),
+		capacity: capacity,
+	}
 }
 
+// FetchPage retrieves a page from the cache (LRU hit) or loads it from disk (miss).
+// Caller MUST call Unpin when done.
 func (bp *BufferPool) FetchPage(id uint64) (*CachedPage, error) {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
+
 	if elem, ok := bp.pages[id]; ok {
 		bp.lru.MoveToFront(elem)
 		cPage := elem.Value.(*CachedPage)
 		cPage.PinCount++
 		return cPage, nil
 	}
+
+	// Evict LRU unpinned page if at capacity
 	if len(bp.pages) >= bp.capacity {
 		for e := bp.lru.Back(); e != nil; e = e.Prev() {
 			cPage := e.Value.(*CachedPage)
 			if cPage.PinCount == 0 {
 				if cPage.Dirty {
-					bp.fm.WritePage(cPage.Page.Header.PageID, cPage.Page)
+					if err := bp.fm.WritePage(cPage.Page.Header.PageID, cPage.Page); err != nil {
+						slog.Error("Failed to evict dirty page", "pageID", cPage.Page.Header.PageID, "error", err)
+					}
 				}
 				delete(bp.pages, cPage.Page.Header.PageID)
 				bp.lru.Remove(e)
@@ -351,8 +461,10 @@ func (bp *BufferPool) FetchPage(id uint64) (*CachedPage, error) {
 			}
 		}
 	}
+
 	p := NewPage(id)
-	if err := bp.fm.ReadPage(id, p); err != nil && err.Error() != "EOF" {
+	err := bp.fm.ReadPage(id, p)
+	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
 	}
 	cPage := &CachedPage{Page: p, PinCount: 1}
@@ -360,6 +472,7 @@ func (bp *BufferPool) FetchPage(id uint64) (*CachedPage, error) {
 	return cPage, nil
 }
 
+// Unpin decrements the pin count of a page. Set dirty=true if the page was modified.
 func (bp *BufferPool) Unpin(id uint64, dirty bool) {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
@@ -374,13 +487,17 @@ func (bp *BufferPool) Unpin(id uint64, dirty bool) {
 	}
 }
 
+// FlushAll writes all dirty pages to disk. Does not fsync the underlying file.
 func (bp *BufferPool) FlushAll() {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 	for e := bp.lru.Front(); e != nil; e = e.Next() {
 		cPage := e.Value.(*CachedPage)
 		if cPage.Dirty {
-			bp.fm.WritePage(cPage.Page.Header.PageID, cPage.Page)
+			if err := bp.fm.WritePage(cPage.Page.Header.PageID, cPage.Page); err != nil {
+				slog.Error("FlushAll: failed to write page", "pageID", cPage.Page.Header.PageID, "error", err)
+				continue
+			}
 			cPage.Dirty = false
 		}
 	}
@@ -389,60 +506,67 @@ func (bp *BufferPool) FlushAll() {
 // ==========================================
 // 6. STORAGE ENGINE CORE
 // ==========================================
+
 type Engine struct {
-	mu           sync.RWMutex
-	pool         *BufferPool
-	wal          *WAL
-	index        map[uint64]Location
+	mu   sync.RWMutex
+	pool *BufferPool
+	wal  *WAL
+	// FIX: Use map[string]Location to eliminate hash collision (silent data corruption).
+	// Previously map[uint64]Location with FNV-64a could silently overwrite entries.
+	index        map[string]Location
 	activePageID uint64
-	totalOps     uint64
+	totalOps     atomic.Uint64
 	dataPath     string
 }
 
-func NewEngine(dataPath string, walPath string) *Engine {
-	fm, _ := NewFileManager(dataPath)
+func NewEngine(dataPath, walPath string) (*Engine, error) {
+	fm, err := NewFileManager(dataPath)
+	if err != nil {
+		return nil, err
+	}
 	bp := NewBufferPool(fm, MaxCachePages)
-	wal := NewWAL(walPath)
+	wal, err := NewWAL(walPath)
+	if err != nil {
+		fm.file.Close()
+		return nil, err
+	}
 
 	e := &Engine{
 		pool:         bp,
 		wal:          wal,
-		index:        make(map[uint64]Location),
+		index:        make(map[string]Location),
 		activePageID: fm.TotalPages,
 		dataPath:     dataPath,
 	}
-
 	if e.activePageID == 0 {
-		e.activePageID = 1
-	} // Page 0 is Header
-	e.RecoverIndex()
-	return e
+		e.activePageID = 1 // Page 0 is reserved for the global header
+	}
+	e.recoverIndex()
+	return e, nil
 }
 
-func HashKey(key string) uint64 {
-	h := fnv.New64a()
-	h.Write([]byte(key))
-	return h.Sum64()
-}
-
-// RecoverIndex melakukan Scan penuh pada Disk saat Startup
-func (e *Engine) RecoverIndex() {
-	slog.Info("Memulai Index Recovery dari Disk...", "TotalPages", e.pool.fm.TotalPages)
+// recoverIndex performs a full disk scan on startup to rebuild the in-memory index.
+func (e *Engine) recoverIndex() {
+	slog.Info("Starting index recovery from disk...", "totalPages", e.pool.fm.TotalPages)
 	var i uint64
 	for i = 1; i <= e.pool.fm.TotalPages; i++ {
 		p := NewPage(i)
-		if err := e.pool.fm.ReadPage(i, p); err == nil {
-			for s := uint16(0); s < p.Header.SlotCount; s++ {
-				rec, err := p.GetRecord(s)
-				if err == nil && (rec.Flags == FlagHead || rec.Flags == FlagHeadSingle) {
-					e.index[HashKey(string(rec.Key))] = Location{PageID: i, SlotID: s}
-				}
+		if err := e.pool.fm.ReadPage(i, p); err != nil {
+			slog.Warn("Skipping page during recovery", "pageID", i, "error", err)
+			continue
+		}
+		for s := uint16(0); s < p.Header.SlotCount; s++ {
+			rec, err := p.GetRecord(s)
+			if err == nil && (rec.Flags == FlagHead || rec.Flags == FlagHeadSingle) {
+				e.index[string(rec.Key)] = Location{PageID: i, SlotID: s}
 			}
 		}
 	}
-	slog.Info("Index Recovery Selesai", "TotalKeys", len(e.index))
+	slog.Info("Index recovery complete", "totalKeys", len(e.index))
 }
 
+// insertChunk finds the active page with space and inserts a record chunk.
+// Must be called while holding e.mu.Lock().
 func (e *Engine) insertChunk(rec *LinkedRecord) (Location, error) {
 	for {
 		cPage, err := e.pool.FetchPage(e.activePageID)
@@ -450,7 +574,7 @@ func (e *Engine) insertChunk(rec *LinkedRecord) (Location, error) {
 			return Location{}, err
 		}
 		slotID, err := cPage.Page.InsertRecord(rec)
-		if err == ErrPageFull {
+		if errors.Is(err, ErrPageFull) {
 			e.pool.Unpin(e.activePageID, false)
 			e.activePageID++
 			continue
@@ -463,6 +587,8 @@ func (e *Engine) insertChunk(rec *LinkedRecord) (Location, error) {
 	}
 }
 
+// deleteChain follows the linked list of chunks and tombstones each one.
+// Must be called while holding e.mu.Lock().
 func (e *Engine) deleteChain(startLoc Location) {
 	curr := startLoc
 	for curr.PageID != 0 {
@@ -473,29 +599,40 @@ func (e *Engine) deleteChain(startLoc Location) {
 		rec, _ := cPage.Page.GetRecord(curr.SlotID)
 		cPage.Page.DeleteRecord(curr.SlotID)
 		e.pool.Unpin(curr.PageID, true)
-		if rec == nil {
+		if rec == nil || rec.Flags == FlagTail || rec.Flags == FlagHeadSingle {
 			break
 		}
 		curr = rec.NextLoc
 	}
 }
 
-// -- Operasi CRUD (Thread-Safe) --
-
-func (e *Engine) Upsert(key string, value []byte) error {
-	if len(key) > MaxKeySize {
-		return ErrPayloadTooBig
+// viewLocked reads and reassembles a value from its chunk chain.
+// Must be called while holding at least e.mu.RLock().
+func (e *Engine) viewLocked(startLoc Location) ([]byte, error) {
+	var result []byte
+	curr := startLoc
+	for curr.PageID != 0 {
+		cPage, err := e.pool.FetchPage(curr.PageID)
+		if err != nil {
+			return nil, err
+		}
+		rec, err := cPage.Page.GetRecord(curr.SlotID)
+		e.pool.Unpin(curr.PageID, false)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, rec.Data...)
+		if rec.Flags == FlagTail || rec.Flags == FlagHeadSingle {
+			break
+		}
+		curr = rec.NextLoc
 	}
-	if len(value) == 0 {
-		value = []byte{}
-	}
+	return result, nil
+}
 
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	e.wal.Append(OpUpsert, key, value) // Crash Safety
-	atomic.AddUint64(&e.totalOps, 1)
-
+// upsertLocked writes key/value as a linked chain of chunks.
+// Must be called while holding e.mu.Lock().
+func (e *Engine) upsertLocked(key string, value []byte) error {
 	totalChunks := len(value) / MaxChunkSize
 	if len(value)%MaxChunkSize != 0 || len(value) == 0 {
 		totalChunks++
@@ -529,156 +666,225 @@ func (e *Engine) Upsert(key string, value []byte) error {
 		nextLoc = loc
 	}
 
-	hash := HashKey(key)
-	if oldLoc, exists := e.index[hash]; exists {
+	if oldLoc, exists := e.index[key]; exists {
 		e.deleteChain(oldLoc)
 	}
-	e.index[hash] = nextLoc
+	e.index[key] = nextLoc
 	return nil
 }
 
+// -- Public Thread-Safe CRUD Operations --
+
+// Upsert inserts or replaces the value for the given key.
+func (e *Engine) Upsert(key string, value []byte) error {
+	if len(key) > MaxKeySize {
+		return ErrPayloadTooBig
+	}
+	if value == nil {
+		value = []byte{}
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if err := e.wal.Append(OpUpsert, key, value); err != nil {
+		return err
+	}
+	e.totalOps.Add(1)
+	return e.upsertLocked(key, value)
+}
+
+// View retrieves the value for the given key.
 func (e *Engine) View(key string) ([]byte, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	loc, exists := e.index[HashKey(key)]
+
+	loc, exists := e.index[key]
 	if !exists {
 		return nil, ErrNotFound
 	}
-
-	var result []byte
-	curr := loc
-	for curr.PageID != 0 {
-		cPage, err := e.pool.FetchPage(curr.PageID)
-		if err != nil {
-			return nil, err
-		}
-		rec, err := cPage.Page.GetRecord(curr.SlotID)
-		e.pool.Unpin(curr.PageID, false)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, rec.Data...)
-		if rec.Flags == FlagTail || rec.Flags == FlagHeadSingle {
-			break
-		}
-		curr = rec.NextLoc
-	}
-	return result, nil
+	return e.viewLocked(loc)
 }
 
+// Delete removes the key and tombstones its chunk chain.
 func (e *Engine) Delete(key string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.wal.Append(OpDelete, key, nil)
-	atomic.AddUint64(&e.totalOps, 1)
 
-	hash := HashKey(key)
-	if loc, exists := e.index[hash]; exists {
+	if err := e.wal.Append(OpDelete, key, nil); err != nil {
+		return err
+	}
+	e.totalOps.Add(1)
+
+	if loc, exists := e.index[key]; exists {
 		e.deleteChain(loc)
-		delete(e.index, hash)
+		delete(e.index, key)
 		return nil
 	}
 	return ErrNotFound
 }
 
+// Incr atomically reads, increments by delta, and writes back a 64-bit integer value.
+// FIX: The previous implementation called View() then Upsert() separately, each acquiring
+// their own lock, resulting in a non-atomic read-modify-write and lost update race condition.
+// Now the entire operation is performed under a single e.mu.Lock().
 func (e *Engine) Incr(key string, delta int64) (int64, error) {
-	// Panggil View langsung (View sudah memiliki e.mu.RLock() di dalamnya)
-	valBytes, err := e.View(key)
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
-	var current int64 = 0
-	if err == nil && len(valBytes) >= 8 {
-		current = int64(binary.LittleEndian.Uint64(valBytes))
+	var current int64
+	if loc, exists := e.index[key]; exists {
+		val, err := e.viewLocked(loc)
+		if err == nil && len(val) >= 8 {
+			current = int64(binary.LittleEndian.Uint64(val))
+		}
 	}
 
-	// Lakukan kalkulasi penambahan (Increment)
 	newVal := current + delta
 	newBytes := make([]byte, 8)
 	binary.LittleEndian.PutUint64(newBytes, uint64(newVal))
 
-	// Panggil Upsert langsung (Upsert sudah memiliki e.mu.Lock() di dalamnya)
-	err = e.Upsert(key, newBytes)
+	if err := e.wal.Append(OpIncr, key, newBytes); err != nil {
+		return 0, err
+	}
+	e.totalOps.Add(1)
 
-	return newVal, err
+	return newVal, e.upsertLocked(key, newBytes)
 }
 
 // ==========================================
 // 7. JANITOR & SHADOW DEFRAGMENTATION
 // ==========================================
-func (e *Engine) StartJanitor(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
+
+// StartJanitor runs the background maintenance loop until ctx is cancelled.
+// The janitor's WaitGroup entry is managed by the caller (main) for clean shutdown.
+func (e *Engine) StartJanitor(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+	ticker := time.NewTicker(JanitorInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			slog.Info("Janitor: context cancelled, stopping.")
 			return
 		case <-ticker.C:
 			e.pool.FlushAll()
 
-			// WAL Checkpoint jika operasi melebihi threshold
-			if atomic.LoadUint64(&e.totalOps) > 10000 {
-				e.wal.Checkpoint()
-				atomic.StoreUint64(&e.totalOps, 0)
+			if e.totalOps.Load() > WALCheckpointOps {
+				// Safe checkpoint order:
+				// 1. All dirty pages are already flushed above.
+				// 2. Fsync the data file to guarantee durability.
+				// 3. Only then truncate the WAL.
+				if err := e.pool.fm.file.Sync(); err != nil {
+					slog.Error("Janitor: fsync failed before checkpoint", "error", err)
+					continue
+				}
+				if err := e.wal.Checkpoint(); err != nil {
+					slog.Error("Janitor: WAL checkpoint failed", "error", err)
+				} else {
+					e.totalOps.Store(0)
+					slog.Info("Janitor: WAL checkpoint complete.")
+				}
 			}
 
-			// Cek Fragmentasi (Simulasi ringan: Jika total page > 1000 dan dirasa bloated)
-			// Dalam produksi ideal, Anda melacak total FragBytes vs Total Space.
-			if e.pool.fm.TotalPages > 500 {
-				// go e.runDefrag() // Non-blocking
+			if e.pool.fm.TotalPages > DefragPageThreshold {
+				go e.runDefrag()
 			}
 		}
 	}
 }
 
-// Shadow Defragmentation: Tulis ulang data live ke file baru
+// runDefrag performs shadow defragmentation: copies all live data to a new file,
+// then atomically swaps it with the current data file.
 func (e *Engine) runDefrag() {
-	slog.Info("Memulai Shadow Defragmentation...")
+	slog.Info("Starting shadow defragmentation...")
 	tmpPath := e.dataPath + ".tmp"
-	tmpFm, _ := NewFileManager(tmpPath)
-	tmpBp := NewBufferPool(tmpFm, 100) // Cache kecil untuk defrag
-	tmpEngine := &Engine{pool: tmpBp, activePageID: 1}
 
-	e.mu.RLock() // Lock baca selama proses copy untuk konsistensi snapshot
-	for keyHash, startLoc := range e.index {
-		// Rekonstruksi key asli dari rantai (Kita harus trace balik key, tapi HashIndex menyulitkan.)
-		// OPTIMALISASI: Dalam arsitektur hash murni, kita baca Head Record untuk dapat `rec.Key`.
-		cPage, _ := e.pool.FetchPage(startLoc.PageID)
-		rec, _ := cPage.Page.GetRecord(startLoc.SlotID)
+	tmpFm, err := NewFileManager(tmpPath)
+	if err != nil {
+		slog.Error("Defrag: failed to create temp file manager", "error", err)
+		return
+	}
+	tmpBp := NewBufferPool(tmpFm, 100)
+	tmpEngine := &Engine{pool: tmpBp, index: make(map[string]Location), activePageID: 1}
+
+	// Snapshot phase: read all live data under a read lock.
+	e.mu.RLock()
+	for key, startLoc := range e.index {
+		cPage, err := e.pool.FetchPage(startLoc.PageID)
+		if err != nil {
+			continue
+		}
+		rec, err := cPage.Page.GetRecord(startLoc.SlotID)
 		e.pool.Unpin(startLoc.PageID, false)
-
-		if rec != nil && len(rec.Key) > 0 {
-			val, _ := e.View(string(rec.Key))
-			tmpEngine.Upsert(string(rec.Key), val) // Tulis rapat ke tmp
-			_ = keyHash                            // Keep compiler happy
+		if err != nil || len(rec.Key) == 0 {
+			continue
+		}
+		// Use viewLocked with the current engine's lock already held.
+		val, err := e.viewLocked(startLoc)
+		if err != nil {
+			slog.Warn("Defrag: failed to read value during snapshot", "key", key, "error", err)
+			continue
+		}
+		// tmpEngine has no concurrent writers, so direct upsertLocked is safe.
+		if err := tmpEngine.upsertLocked(key, val); err != nil {
+			slog.Warn("Defrag: failed to write value to temp engine", "key", key, "error", err)
 		}
 	}
 	e.mu.RUnlock()
 
-	// Fase Swap (Write Lock sebentar)
+	// Swap phase: acquire write lock to finalize the swap.
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
 	tmpBp.FlushAll()
+	if err := tmpFm.file.Sync(); err != nil {
+		slog.Error("Defrag: failed to sync temp file before swap", "error", err)
+		tmpFm.file.Close()
+		os.Remove(tmpPath)
+		return
+	}
 	tmpFm.file.Close()
 	e.pool.fm.file.Close()
 
-	os.Rename(tmpPath, e.dataPath) // Atomic OS level swap
+	if err := os.Rename(tmpPath, e.dataPath); err != nil {
+		slog.Error("Defrag: atomic rename failed", "error", err)
+		// Re-open the original file to recover.
+		newFm, _ := NewFileManager(e.dataPath)
+		e.pool.fm = newFm
+		return
+	}
 
-	// Re-init pointer engine
-	newFm, _ := NewFileManager(e.dataPath)
+	newFm, err := NewFileManager(e.dataPath)
+	if err != nil {
+		slog.Error("Defrag: failed to re-open data file after swap", "error", err)
+		return
+	}
 	e.pool.fm = newFm
 	e.activePageID = tmpEngine.activePageID
-	e.wal.Checkpoint()
-	slog.Info("Defragmentasi Selesai. File Storage kembali rapat.")
+	if err := e.wal.Checkpoint(); err != nil {
+		slog.Error("Defrag: WAL checkpoint after defrag failed", "error", err)
+	}
+	slog.Info("Shadow defragmentation complete. Storage compacted.")
 }
 
 // ==========================================
 // 8. TCP LAYER & PROTOCOL
 // ==========================================
+
+// handleConnection processes the binary protocol for a single TCP connection.
+// Protocol (request):  Magic(2) + Op(1) + ReqID(4) + KeyLen(1) + ValLen(4) + Key + Val
+// Protocol (response): Magic(2) + ReqID(4) + Status(1) + DataLen(4) + Data
 func handleConnection(conn net.Conn, engine *Engine) {
 	defer conn.Close()
 	headerBuf := make([]byte, 12)
 	for {
-		_, err := io.ReadFull(conn, headerBuf)
-		if err != nil {
+		// Set a read deadline to prevent zombie connections.
+		if err := conn.SetDeadline(time.Now().Add(ConnReadDeadline)); err != nil {
+			return
+		}
+
+		if _, err := io.ReadFull(conn, headerBuf); err != nil {
 			return
 		}
 
@@ -689,6 +895,12 @@ func handleConnection(conn net.Conn, engine *Engine) {
 		reqID := headerBuf[3:7]
 		keyLen := int(headerBuf[7])
 		valLen := binary.LittleEndian.Uint32(headerBuf[8:12])
+
+		// FIX: Protect against memory exhaustion DoS attack via oversized payload.
+		if int(valLen) > MaxValueSize {
+			slog.Warn("Rejected oversized payload", "valLen", valLen, "limit", MaxValueSize)
+			return
+		}
 
 		payloadBuf := make([]byte, keyLen+int(valLen))
 		if _, err := io.ReadFull(conn, payloadBuf); err != nil {
@@ -702,14 +914,15 @@ func handleConnection(conn net.Conn, engine *Engine) {
 
 		switch op {
 		case OpPing:
-			// Ping OK
+			// No-op, StatusOk is returned.
 		case OpUpsert:
 			if err := engine.Upsert(key, value); err != nil {
+				slog.Warn("Upsert failed", "key", key, "error", err)
 				status = StatusError
 			}
 		case OpView:
 			data, err := engine.View(key)
-			if err == ErrNotFound {
+			if errors.Is(err, ErrNotFound) {
 				status = StatusNotFound
 			} else if err != nil {
 				status = StatusError
@@ -717,53 +930,66 @@ func handleConnection(conn net.Conn, engine *Engine) {
 				responseData = data
 			}
 		case OpDelete:
-			if err := engine.Delete(key); err == ErrNotFound {
+			err := engine.Delete(key)
+			if errors.Is(err, ErrNotFound) {
 				status = StatusNotFound
 			} else if err != nil {
 				status = StatusError
 			}
 		case OpIncr:
-			if len(value) == 8 {
-				delta := int64(binary.LittleEndian.Uint64(value))
-				newVal, err := engine.Incr(key, delta)
-				if err != nil {
-					status = StatusError
-				} else {
-					responseData = make([]byte, 8)
-					binary.LittleEndian.PutUint64(responseData, uint64(newVal))
-				}
-			} else {
+			if len(value) != 8 {
 				status = StatusError
+				break
+			}
+			delta := int64(binary.LittleEndian.Uint64(value))
+			newVal, err := engine.Incr(key, delta)
+			if err != nil {
+				status = StatusError
+			} else {
+				responseData = make([]byte, 8)
+				binary.LittleEndian.PutUint64(responseData, uint64(newVal))
 			}
 		default:
 			status = StatusError
 		}
 
+		// Write response: Magic(2) + ReqID(4) + Status(1) + DataLen(4)
 		respHeader := make([]byte, 11)
 		binary.LittleEndian.PutUint16(respHeader[0:2], MagicBytes)
 		copy(respHeader[2:6], reqID)
 		respHeader[6] = status
 		binary.LittleEndian.PutUint32(respHeader[7:11], uint32(len(responseData)))
-		conn.Write(respHeader)
+		if _, err := conn.Write(respHeader); err != nil {
+			return
+		}
 		if len(responseData) > 0 {
-			conn.Write(responseData)
+			if _, err := conn.Write(responseData); err != nil {
+				return
+			}
 		}
 	}
 }
 
+// startTCPServer accepts incoming connections and dispatches them to handleConnection.
+// Uses a semaphore channel to enforce MaxConn limit.
 func startTCPServer(ctx context.Context, wg *sync.WaitGroup, engine *Engine) {
 	listener, err := net.Listen("tcp", Port)
 	if err != nil {
-		os.Exit(1)
+		slog.Error("Failed to start TCP listener", "port", Port, "error", err)
+		return
 	}
-	slog.Info("Storage TCP Engine Berjalan", "port", Port)
+	slog.Info("Storage TCP engine started", "port", Port)
 
 	sem := make(chan struct{}, MaxConn)
-	go func() { <-ctx.Done(); listener.Close() }()
+	go func() {
+		<-ctx.Done()
+		listener.Close()
+	}()
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			// Accept returns an error when the listener is closed (ctx cancelled).
 			return
 		}
 		sem <- struct{}{}
@@ -779,6 +1005,7 @@ func startTCPServer(ctx context.Context, wg *sync.WaitGroup, engine *Engine) {
 // ==========================================
 // 9. MAIN ENTRY & GRACEFUL SHUTDOWN
 // ==========================================
+
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
@@ -786,32 +1013,58 @@ func main() {
 	walPath := "/data/wal.bin"
 	if _, err := os.Stat("/data"); os.IsNotExist(err) {
 		dataPath = "data.bin"
-		walPath = "wal.bin" // Fallback local testing
+		walPath = "wal.bin"
+		slog.Info("Falling back to local paths for development", "dataPath", dataPath, "walPath", walPath)
 	}
 
-	engine := NewEngine(dataPath, walPath)
+	engine, err := NewEngine(dataPath, walPath)
+	if err != nil {
+		slog.Error("Failed to initialize engine", "error", err)
+		os.Exit(1)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Start Background Janitor
-	go engine.StartJanitor(ctx)
-
 	var wg sync.WaitGroup
-	go startTCPServer(ctx, &wg, engine)
+
+	// FIX: Janitor is now tracked by wg for clean shutdown, preventing data races
+	// during FlushAll/Checkpoint when the main goroutine also calls them.
+	wg.Add(1)
+	go engine.StartJanitor(ctx, &wg)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		startTCPServer(ctx, &wg, engine)
+	}()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
 
-	slog.Info("Sinyal Terminasi Diterima. Memulai Graceful Shutdown...")
-	cancel() // Stop TCP & Janitor
-	wg.Wait()
+	slog.Info("Termination signal received. Starting graceful shutdown...")
+	cancel()  // Signal TCP server and Janitor to stop.
+	wg.Wait() // Wait for all goroutines (connections + janitor) to finish.
 
+	// Final flush: ensure all remaining dirty pages are written.
 	engine.pool.FlushAll()
-	engine.wal.Checkpoint()
-	engine.pool.fm.file.Sync()
-	engine.pool.fm.file.Close()
-	engine.wal.file.Close()
 
-	slog.Info("Shutdown Selesai. Data Aman.")
-	os.Exit(0)
+	// Safe checkpoint sequence:
+	// 1. Flush dirty pages (done above).
+	// 2. Fsync the data file (guarantee durability).
+	// 3. Checkpoint (truncate) the WAL.
+	if err := engine.pool.fm.file.Sync(); err != nil {
+		slog.Error("Shutdown: fsync failed", "error", err)
+	}
+	if err := engine.wal.Checkpoint(); err != nil {
+		slog.Error("Shutdown: WAL checkpoint failed", "error", err)
+	}
+	if err := engine.pool.fm.file.Close(); err != nil {
+		slog.Error("Shutdown: failed to close data file", "error", err)
+	}
+	if err := engine.wal.file.Close(); err != nil {
+		slog.Error("Shutdown: failed to close WAL file", "error", err)
+	}
+
+	slog.Info("Shutdown complete. Data is safe.")
 }
